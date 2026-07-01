@@ -1,0 +1,349 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# =========================
+# FORM
+# =========================
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Documentador SSIS"
+$form.Size = "600,250"
+$form.StartPosition = "CenterScreen"
+
+# Campos
+$txtPackage = New-Object System.Windows.Forms.TextBox
+$txtPackage.Location = "110,20"
+$txtPackage.Size = "350,20"
+$form.Controls.Add($txtPackage)
+
+$txtOutput = New-Object System.Windows.Forms.TextBox
+$txtOutput.Location = "110,60"
+$txtOutput.Size = "350,20"
+$form.Controls.Add($txtOutput)
+
+$form.Controls.Add((New-Object System.Windows.Forms.Label -Property @{
+    Text = "Pacote SSIS:"; Location = "10,20"
+}))
+$form.Controls.Add((New-Object System.Windows.Forms.Label -Property @{
+    Text = "Salvar DOCX:"; Location = "10,60"
+}))
+
+# Botões
+$btnBrowsePkg = New-Object System.Windows.Forms.Button
+$btnBrowsePkg.Text = "..."
+$btnBrowsePkg.Location = "470,18"
+$form.Controls.Add($btnBrowsePkg)
+
+$btnBrowseOut = New-Object System.Windows.Forms.Button
+$btnBrowseOut.Text = "..."
+$btnBrowseOut.Location = "470,58"
+$form.Controls.Add($btnBrowseOut)
+
+$btnGenerate = New-Object System.Windows.Forms.Button
+$btnGenerate.Text = "Documentar"
+$btnGenerate.Location = "200,150"
+$form.Controls.Add($btnGenerate)
+
+# Progress Bar
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.Location = "50,110"
+$progress.Size = "500,20"
+$progress.Minimum = 0
+$progress.Maximum = 100
+$form.Controls.Add($progress)
+
+# =========================
+# FILE DIALOGS
+# =========================
+$btnBrowsePkg.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = "SSIS (*.dtsx)|*.dtsx"
+    if ($dlg.ShowDialog() -eq "OK"){
+        $txtPackage.Text = $dlg.FileName
+    }
+})
+
+$btnBrowseOut.Add_Click({
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = "Word (*.docx)|*.docx"
+    if ($dlg.ShowDialog() -eq "OK"){
+        $txtOutput.Text = $dlg.FileName
+    }
+})
+
+# =========================
+# BOTÃO GERAR
+# =========================
+$btnGenerate.Add_Click({
+
+    try{
+
+        $progress.Value = 10
+
+        $dtsxPath = $txtPackage.Text
+        $outputDocx = $txtOutput.Text
+
+        # ===== AQUI COMEÇA SEU SCRIPT ORIGINAL =====
+        [xml]$pkg = Get-Content $dtsxPath
+
+        $ns = New-Object System.Xml.XmlNamespaceManager($pkg.NameTable)
+        $ns.AddNamespace("DTS", "www.microsoft.com/SqlServer/Dts")
+
+        $word = New-Object -ComObject Word.Application
+        $word.Visible = $false
+        $doc = $word.Documents.Add()
+
+        function Add-Title($t){
+            $p = $doc.Paragraphs.Add()
+            $p.Range.Text = $t
+            $p.Range.Font.Bold = $true
+            $p.Range.Font.Size = 16
+            $p.Range.InsertParagraphAfter()
+        }
+
+        function Add-Text($t){
+            $p = $doc.Paragraphs.Add()
+            $p.Range.Text = $t
+            $p.Range.Font.Size = 11
+            $p.Range.InsertParagraphAfter()
+        }
+
+        $pkgName = $pkg.SelectSingleNode("//DTS:Executable", $ns).Attributes["DTS:ObjectName"].Value
+
+        Add-Title "Documentação SSIS"
+        Add-Text "Pacote: $pkgName"
+        Add-Text "Arquivo: $dtsxPath"
+        Add-Text ""
+
+        $progress.Value = 20
+
+        # CONEXÕES
+        Add-Title "Conexões"
+        $connNodes = $pkg.SelectNodes("//DTS:ConnectionManager", $ns)
+
+        foreach ($c in $connNodes){
+            $nameAttr = $c.Attributes["DTS:ObjectName"]
+            if ($nameAttr -and $nameAttr.Value.Trim() -ne ""){
+                Add-Text "- $($nameAttr.Value.Trim())"
+            }
+        }
+
+        Add-Text ""
+
+        # SQL FUNCTION
+        function Get-CleanSql($node){
+
+            $sql = $null
+
+            $n1 = $node.SelectSingleNode(".//*[local-name()='SqlTaskData']")
+            if ($n1 -and $n1.Attributes["SqlStatementSource"]){
+                $sql = $n1.Attributes["SqlStatementSource"].Value
+            }
+
+            if (-not $sql){
+                $n2 = $node.SelectSingleNode(".//*[local-name()='Property' and @Name='SqlStatementSource']")
+                if ($n2){
+                    $sql = $n2.InnerText
+                }
+            }
+
+            if (-not $sql){
+                $raw = $node.InnerXml
+                $m = [regex]::Match($raw, "EXEC\s+[^\r\n<]+")
+                if ($m.Success){
+                    $sql = $m.Value
+                }
+            }
+
+            if (-not $sql){ return $null }
+
+            $sql = $sql -replace 'xmlns:SQLTask="[^"]+"', ''
+            $sql = $sql -replace '/>$', ''
+            $sql = $sql -replace '"\s*$', ''
+            $sql = $sql -replace '^EXEC\s+', ''
+
+            return $sql.Trim()
+        }
+
+        $progress.Value = 40
+
+        # EMAILS
+        $mailTasks = $pkg.SelectNodes("//DTS:Executable[contains(@DTS:ExecutableType,'SendMail')]", $ns)
+
+        $failureMails = @{}
+        $successMails = @()
+
+        foreach ($m in $mailTasks){
+            $name = $m.Attributes["DTS:ObjectName"].Value
+            if ($name -match "Falha"){ $failureMails[$name] = $true }
+            if ($name -match "Sucesso"){ $successMails += $name }
+        }
+
+        $progress.Value = 60
+
+        # =========================
+# MAPA DO FLUXO
+# =========================
+$flowMap = @{}
+
+$constraints = $pkg.SelectNodes("//DTS:PrecedenceConstraint", $ns)
+
+foreach($c in $constraints){
+
+    if(!$c.Attributes["DTS:From"] -or !$c.Attributes["DTS:To"]){
+        continue
+    }
+
+    $from = ($c.Attributes["DTS:From"].Value -split "\\")[-1]
+    $to   = ($c.Attributes["DTS:To"].Value -split "\\")[-1]
+
+    if(-not $flowMap.ContainsKey($from)){
+        $flowMap[$from] = @{
+            Success = @()
+            Failure = @()
+        }
+    }
+
+    $value = ""
+
+    if($c.Attributes["DTS:Value"]){
+        $value = $c.Attributes["DTS:Value"].Value
+    }
+
+    if($value -eq "Failure"){
+        $flowMap[$from].Failure += $to
+    }
+    else{
+        $flowMap[$from].Success += $to
+    }
+}
+
+        # =========================
+# MAPA DO FLUXO
+# =========================
+$flowMap = @{}
+
+$constraints = $pkg.SelectNodes("//DTS:PrecedenceConstraint", $ns)
+
+foreach($c in $constraints){
+
+    if(!$c.Attributes["DTS:From"] -or !$c.Attributes["DTS:To"]){
+        continue
+    }
+
+    $from = ($c.Attributes["DTS:From"].Value -split "\\")[-1]
+    $to   = ($c.Attributes["DTS:To"].Value -split "\\")[-1]
+
+    if(-not $flowMap.ContainsKey($from)){
+        $flowMap[$from] = @{
+            Success = @()
+            Failure = @()
+        }
+    }
+
+    $value = ""
+
+    if($c.Attributes["DTS:Value"]){
+        $value = $c.Attributes["DTS:Value"].Value
+    }
+
+    # no seu pacote:
+    # Value=1 significa Failure
+    if($value -eq "1"){
+        $flowMap[$from].Failure += $to
+    }
+    else{
+        $flowMap[$from].Success += $to
+    }
+}
+
+# =========================
+# TASKS DO PACKAGE
+# =========================
+
+Add-Title "Fluxo de Controle"
+
+$tasks = $pkg.SelectNodes(
+    "/DTS:Executable/DTS:Executables/DTS:Executable",
+    $ns
+)
+
+$i = 1
+
+foreach($t in $tasks){
+
+    $name = $t.Attributes["DTS:ObjectName"].Value
+    $type = $t.Attributes["DTS:ExecutableType"].Value
+
+    Add-Title "$i - $name"
+
+    $sql = Get-CleanSql $t
+
+    if($sql){
+
+        Add-Text "Query:"
+        Add-Text $sql
+        Add-Text ""
+    }
+
+    if(
+        $flowMap.ContainsKey($name) -and
+        (
+            $flowMap[$name].Success.Count -gt 0 -or
+            $flowMap[$name].Failure.Count -gt 0
+        )
+    ){
+
+        Add-Text "Fluxo:"
+
+        foreach($s in $flowMap[$name].Success){
+            Add-Text "    SUCESSO -> $s"
+        }
+
+        foreach($f in $flowMap[$name].Failure){
+            Add-Text "    FALHA   -> $f"
+        }
+
+        Add-Text ""
+    }
+
+    $i++
+}
+
+# =========================
+# RESUMO DE E-MAILS
+# =========================
+
+Add-Title "Notificações"
+
+foreach ($s in $successMails){
+    Add-Text "SUCESSO -> $s"
+}
+
+foreach ($f in $failureMails.Keys){
+    Add-Text "FALHA -> $f"
+}
+$progress.Value = 90
+
+$doc.SaveAs([ref]$outputDocx)
+
+$doc.Close()
+$word.Quit()
+
+$progress.Value = 100
+
+[System.Windows.Forms.MessageBox]::Show(
+    "Documento gerado com sucesso!"
+)
+
+        $progress.Value = 100
+
+        [System.Windows.Forms.MessageBox]::Show("Documento gerado com sucesso!")
+
+    }
+    catch{
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message)
+    }
+
+})
+
+$form.ShowDialog()
